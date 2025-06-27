@@ -1,8 +1,11 @@
+use log::{debug, info, trace};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncReadExt;
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch::Receiver;
-use tokio::net::{TcpListener, UdpSocket};
 
 use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
@@ -10,7 +13,9 @@ use gstreamer::{self as gst, MessageView};
 use gstreamer_app as gst_app;
 use tokio::sync::watch;
 
-pub async fn start_pipeline(port: u16) -> color_eyre::Result<()> {
+use itertools::Itertools;
+
+pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
         .property_from_str("emit-signals", "true")
@@ -21,8 +26,7 @@ pub async fn start_pipeline(port: u16) -> color_eyre::Result<()> {
         .property_from_str("format", "time")
         .property_from_str("do-timestamp", "true")
         .build()?;
-    let caps = gst::Caps::builder("video/x-h264")
-        .build();
+    let caps = gst::Caps::builder("video/x-h264").build();
     source.set_property("caps", &caps);
     let parser = gst::ElementFactory::make_with_name("h264parse", Some("parser"))?;
     let decoder = gst::ElementFactory::make("decodebin")
@@ -30,7 +34,10 @@ pub async fn start_pipeline(port: u16) -> color_eyre::Result<()> {
         .property_from_str("max-size-buffers", "1")
         .build()?;
     let convert = gst::ElementFactory::make_with_name("videoconvert", Some("convert"))?;
-    let sink = gst::ElementFactory::make_with_name("autovideosink", Some("sink"))?;
+    let sink = gst::ElementFactory::make("autovideosink")
+        .name("sink")
+        .property_from_str("sync", "false")
+        .build()?;
 
     let pipeline = gst::Pipeline::with_name("decoding");
     pipeline.add_many([&source, &parser, &decoder, &convert, &sink])?;
@@ -40,7 +47,7 @@ pub async fn start_pipeline(port: u16) -> color_eyre::Result<()> {
 
     decoder.connect_pad_added(move |src, src_pad| {
         let convert_pad = convert.static_pad("sink").unwrap();
-        
+
         if convert_pad.is_linked() {
             return;
         }
@@ -50,21 +57,145 @@ pub async fn start_pipeline(port: u16) -> color_eyre::Result<()> {
 
     pipeline.set_state(gst::State::Playing)?;
 
-    let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    let (mut stream, _) = listener.accept().await?;
-    loop {
-        let size = stream.read_u64().await? as usize;
-        let mut data = vec![0; size];
-        stream.read_exact(&mut data).await?;
-        
-        let mut buffer = gst::Buffer::with_size(size)?;
-        {
-            let mut map = buffer.get_mut().unwrap().map_writable()?;
-            map.as_mut_slice().copy_from_slice(&data);
+    let (tx, rx) = tokio::sync::watch::channel(Default::default());
+
+    // Latency pad probes
+    let latency_start = Arc::new(AtomicU64::new(0));
+    let latency = Arc::new(AtomicU64::new(0));
+    let clock = loop {
+        match pipeline.clock() {
+            Some(clock) => break clock,
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
-        
-        app_src.push_buffer(buffer)?;
+    };
+
+    let src_pad = source.static_pad("src").unwrap();
+    {
+        let latency_start = Arc::clone(&latency_start);
+        let clock = clock.clone();
+
+        src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+            if info.buffer().is_some() {
+                let now = clock.time().unwrap();
+                // *latency_start.lock().unwrap() = now.into();
+                latency_start.store(now.into(), Ordering::Release);
+                trace!("Captured at: {:?}", now);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    let sink_pad = sink.static_pad("sink").unwrap();
+    {
+        let latency_start = latency_start.clone();
+        let clock = clock.clone();
+        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            let now: u64 = clock.time().unwrap().into();
+            let start_time = latency_start.load(Ordering::Acquire);
+            let diff = now - start_time;
+            trace!("Latency: {} ms", diff as f64 / 1_000_000.0);
+            let decoding_latency = Duration::from_nanos(diff);
+            let (encoding_latency, network_latency) = *rx.borrow();
+            let total = encoding_latency + decoding_latency + network_latency;
+            debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
+
+    let mut stream = TcpStream::connect(format!("{ip}:{port}")).await?;
+    info!(
+        "Connected to server {} with {}",
+        stream.peer_addr().unwrap(),
+        stream.local_addr().unwrap()
+    );
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp_port = socket.local_addr()?.port();
+
+    stream.write_u16(udp_port).await?;
+
+    let mut cur_seq_num = 0;
+    let mut cur_total_size = 0;
+    let mut cur_encoding_latency = 0;
+    let mut cur_network_start = 0;
+    let mut data = vec![];
+    let mut buf = [0; 1250];
+    loop {
+        let size = socket.recv(&mut buf).await?;
+        match buf[0] {
+            255 => {
+                if !data.is_empty() {
+                    let mut buffer = gst::Buffer::with_size(data.len())?;
+                    {
+                        let mut map = buffer.get_mut().unwrap().map_writable()?;
+                        map.as_mut_slice().copy_from_slice(&data);
+                    }
+                    app_src.push_buffer(buffer)?;
+
+                    let network_end_time = {
+                        let time = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap();
+                        time.as_nanos() as u64
+                    };
+
+                    let encoding_latency = Duration::from_nanos(cur_encoding_latency);
+                    let network_latency =
+                        Duration::from_nanos(network_end_time - cur_network_start);
+
+                    tx.send((encoding_latency, network_latency))?;
+
+                    data.clear();
+                }
+                let (encoding_latency, network_start_time, seq_num, total_size) = buf[1..size]
+                    .chunks(8)
+                    .map(|x| u64::from_be_bytes(x.try_into().unwrap()))
+                    .collect_tuple()
+                    .unwrap();
+                if cur_seq_num < seq_num {
+                    cur_seq_num = seq_num;
+                    cur_total_size = total_size;
+                    cur_encoding_latency = encoding_latency;
+                    cur_network_start = network_start_time;
+                }
+            }
+            254 => {
+                let seq_num = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                if seq_num == cur_seq_num {
+                    data.extend_from_slice(&buf[9..size]);
+                }
+            }
+            _ => (),
+        }
+        if data.len() > cur_total_size as usize {
+            debug!("Data full!");
+            let mut buffer = gst::Buffer::with_size(data.len())?;
+            {
+                let mut map = buffer.get_mut().unwrap().map_writable()?;
+                map.as_mut_slice().copy_from_slice(&data);
+            }
+            app_src.push_buffer(buffer)?;
+
+            let network_end_time = {
+                let time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                time.as_nanos() as u64
+            };
+
+            let encoding_latency = Duration::from_nanos(cur_encoding_latency);
+            let network_latency = Duration::from_nanos(network_end_time - cur_network_start);
+
+            tx.send((encoding_latency, network_latency))?;
+
+            data.clear();
+
+            cur_total_size = 0;
+            cur_seq_num = 0;
+            cur_encoding_latency = 0;
+        }
     }
     Ok(())
 }
