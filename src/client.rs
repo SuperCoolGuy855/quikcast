@@ -1,16 +1,16 @@
-use log::{debug, info, trace};
+use log::{debug, error, info, trace, warn};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch::Receiver;
+use tokio::sync::watch::{Receiver, Sender};
 
 use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
 use gstreamer::{self as gst, MessageView};
-use gstreamer_app as gst_app;
+use gstreamer_app::{self as gst_app, AppSrc};
 use tokio::sync::watch;
 
 use itertools::Itertools;
@@ -61,7 +61,6 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
 
     // Latency pad probes
     let latency_start = Arc::new(AtomicU64::new(0));
-    let latency = Arc::new(AtomicU64::new(0));
     let clock = loop {
         match pipeline.clock() {
             Some(clock) => break clock,
@@ -102,8 +101,6 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
         });
     }
 
-    let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
-
     let mut stream = TcpStream::connect(format!("{ip}:{port}")).await?;
     info!(
         "Connected to server {} with {}",
@@ -116,14 +113,47 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
 
     stream.write_u16(udp_port).await?;
 
+    let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
+
+    tokio::spawn(async {
+        frame_receive(app_src, stream, socket, tx).await.unwrap();
+    });
+
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(None) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Error(e) => {
+                error!("Gstreamer error: {e}");
+                break;
+            }
+            MessageView::Eos(e) => {
+                warn!("EOS detected! {e:?}");
+                break;
+            }
+            _ => (),
+        }
+    }
+
+    Ok(())
+}
+
+async fn frame_receive(
+    app_src: AppSrc,
+    stream: TcpStream,
+    socket: UdpSocket,
+    tx: Sender<(Duration, Duration)>,
+) -> color_eyre::Result<()> {
     let mut cur_seq_num = 0;
     let mut cur_total_size = 0;
     let mut cur_encoding_latency = 0;
     let mut cur_network_start = 0;
     let mut data = vec![];
     let mut buf = [0; 1250];
+
     loop {
         let size = socket.recv(&mut buf).await?;
+        trace!("Data received!");
         match buf[0] {
             255 => {
                 if !data.is_empty() {
@@ -133,6 +163,7 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
                         map.as_mut_slice().copy_from_slice(&data);
                     }
                     app_src.push_buffer(buffer)?;
+                    trace!("Frame sent!");
 
                     let network_end_time = {
                         let time = SystemTime::now()
@@ -197,5 +228,4 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
             cur_encoding_latency = 0;
         }
     }
-    Ok(())
 }

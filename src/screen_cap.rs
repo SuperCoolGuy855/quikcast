@@ -6,14 +6,14 @@ use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
 use gstreamer::{self as gst, MessageView};
 use gstreamer_app as gst_app;
-use log::{debug, trace};
+use log::{debug, error, trace, warn};
 use tokio::sync::watch::Sender;
 
 pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("d3d11screencapturesrc")
         .name("source")
         .property_from_str("capture-api", "0")
-        .property_from_str("monitor-index", "0")
+        .property_from_str("monitor-index", "1") // TODO: Dectect bogus index
         .property_from_str("show-cursor", "true")
         .build()?;
     let capsfilter = gst::ElementFactory::make_with_name("capsfilter", Some("rate_filter"))?;
@@ -96,7 +96,7 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
         let clock = clock.clone();
 
         src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            if info.buffer().is_some()  {
+            if info.buffer().is_some() {
                 let now = clock.time().unwrap();
                 // *latency_start.lock().unwrap() = now.into();
                 latency_start.store(now.into(), Ordering::Release);
@@ -137,21 +137,40 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
 
     debug!("Screen capture started!");
 
-    while let Ok(sample) = app_sink.pull_sample() {
-        if let Some(buffer) = sample.buffer() {
-            let map = buffer.map_readable().unwrap();
+    std::thread::spawn(move || {
+        while let Ok(sample) = app_sink.pull_sample() {
+            if let Some(buffer) = sample.buffer() {
+                let map = buffer.map_readable().unwrap();
 
-            // let data = map.as_slice();
-            // file.write_all(data).unwrap();
-            // file.flush().unwrap();
+                // let data = map.as_slice();
+                // file.write_all(data).unwrap();
+                // file.flush().unwrap();
 
-            let lat = latency.load(Ordering::Acquire);
-            let mut data = lat.to_be_bytes().to_vec();
-            data.extend_from_slice(&map);
-            if tx.send(data).is_err() {
-                break; // All receivers dropped
+                let lat = latency.load(Ordering::Acquire);
+                let mut data = lat.to_be_bytes().to_vec();
+                data.extend_from_slice(&map);
+                if tx.send(data).is_err() {
+                    break; // All receivers dropped
+                }
+                trace!("Frame sent!");
             }
-            trace!("Frame sent!");
+        }
+    });
+
+    let bus = pipeline.bus().unwrap();
+
+    for msg in bus.iter_timed(None) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Error(e) => {
+                error!("Gstreamer error: {e}");
+                break;
+            }
+            MessageView::Eos(e) => {
+                warn!("EOS detected! {e:?}");
+                break;
+            }
+            _ => (),
         }
     }
 
