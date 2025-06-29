@@ -1,9 +1,15 @@
-use std::{net::SocketAddr, time::SystemTime};
+use std::{
+    net::SocketAddr,
+    time::{Duration, SystemTime},
+};
 
+use color_eyre::eyre::bail;
 use itertools::Itertools;
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use tokio::{
-    io::AsyncReadExt, net::{TcpListener, TcpStream, UdpSocket}, sync::watch::{self, Receiver, Sender}
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::watch::{self, Receiver, Sender},
 };
 
 use crate::screen_cap;
@@ -43,6 +49,29 @@ async fn connection(
         udp_addr
     );
 
+    tokio::spawn(async { send_frame(socket, rx).await.unwrap() });
+
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut heartbeat_index = 0;
+
+    loop {
+        interval.tick().await;
+
+        match stream.write_u64(heartbeat_index).await {
+            Ok(_) => {}
+            Err(e) => {
+                warn!("Client {addr} disconnected: {}", e);
+                bail!(e);
+            }
+        }
+
+        heartbeat_index += 1;
+    }
+
+    Ok(())
+}
+
+async fn send_frame(socket: UdpSocket, mut rx: Receiver<Vec<u8>>) -> color_eyre::Result<()> {
     let mut seq_num: u64 = 1;
     loop {
         rx.changed().await?;
@@ -81,5 +110,4 @@ async fn connection(
 
         seq_num += 1;
     }
-    Ok(())
 }

@@ -116,31 +116,50 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
     let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
 
     tokio::spawn(async {
-        frame_receive(app_src, stream, socket, tx).await.unwrap();
+        frame_receive(app_src, socket, tx).await.unwrap();
     });
 
     let bus = pipeline.bus().unwrap();
-    for msg in bus.iter_timed(None) {
-        use gst::MessageView;
-        match msg.view() {
-            MessageView::Error(e) => {
-                error!("Gstreamer error: {e}");
-                break;
+    std::thread::spawn(move || {
+        for msg in bus.iter_timed(None) {
+            use gst::MessageView;
+            match msg.view() {
+                MessageView::Error(e) => {
+                    error!("Gstreamer error: {e}");
+                    break;
+                }
+                MessageView::Eos(e) => {
+                    warn!("EOS detected! {e:?}");
+                    break;
+                }
+                _ => (),
             }
-            MessageView::Eos(e) => {
-                warn!("EOS detected! {e:?}");
-                break;
+        }
+    });
+
+    loop {
+        match tokio::time::timeout(Duration::from_millis(1000), stream.read_u64()).await {
+            Ok(Ok(x)) => {
+                trace!("Server heartbeat: {x}");
             }
-            _ => (),
+            Ok(Err(e)) => {
+                error!("Server disconnected: {}", e);
+                bail!(e);
+            }
+            Err(_) => {
+                error!("Server heartbeat timeout - server likely dead");
+                bail!("Heartbeat timeout!");
+            }
         }
     }
+
+    pipeline.set_state(gst::State::Null)?;
 
     Ok(())
 }
 
 async fn frame_receive(
     app_src: AppSrc,
-    stream: TcpStream,
     socket: UdpSocket,
     tx: Sender<(Duration, Duration)>,
 ) -> color_eyre::Result<()> {

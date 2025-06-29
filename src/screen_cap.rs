@@ -13,7 +13,7 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("d3d11screencapturesrc")
         .name("source")
         .property_from_str("capture-api", "0")
-        .property_from_str("monitor-index", "1") // TODO: Dectect bogus index
+        .property_from_str("monitor-index", "0") // TODO: Dectect bogus index
         .property_from_str("show-cursor", "true")
         .build()?;
     let capsfilter = gst::ElementFactory::make_with_name("capsfilter", Some("rate_filter"))?;
