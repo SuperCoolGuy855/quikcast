@@ -13,10 +13,10 @@ use tokio::{
     time::Instant,
 };
 
-use crate::screen_cap;
+use crate::{screen_cap, CLI_ARGS};
 
-pub async fn start_server(port: u16) -> color_eyre::Result<()> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+pub async fn start_server() -> color_eyre::Result<()> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", CLI_ARGS.port)).await?;
     info!("TCP server started on {}", listener.local_addr().unwrap());
 
     let (tx, rx) = watch::channel(vec![]);

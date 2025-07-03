@@ -15,10 +15,10 @@ use tokio::sync::watch;
 
 use itertools::Itertools;
 
-use crate::server;
+use crate::{server, CLI_ARGS};
 
 // TODO: Shutdown when windows is closed
-pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
+pub async fn start_pipeline() -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
         .property_from_str("emit-signals", "false")
@@ -73,6 +73,16 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
             return;
         }
 
+        if let Some(decodebin) = src.downcast_ref::<gst::Bin>() {
+            for element in decodebin.iterate_elements().into_iter().flatten() {
+                if let Some(factory) = element.factory() {
+                    if factory.klass().contains("Decoder") {
+                        debug!("Selected decoder: {}", factory.name());
+                    }
+                }
+            }
+        }
+
         src_pad.link(&convert_pad).unwrap();
     });
 
@@ -122,6 +132,8 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
         });
     }
 
+    let ip = CLI_ARGS.ip.as_ref().expect("Checked by main function");
+    let port = CLI_ARGS.port;
     let mut stream = TcpStream::connect(format!("{ip}:{port}")).await?;
     info!(
         "Connected to server {} with {}",
@@ -197,7 +209,8 @@ async fn frame_receive(
         .write(true)
         .create(true)
         .truncate(true)
-        .open("client.h264").await?;
+        .open("client.h264")
+        .await?;
 
     loop {
         let size = socket.recv(&mut buf).await?;

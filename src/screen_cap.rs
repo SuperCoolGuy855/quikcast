@@ -11,6 +11,8 @@ use tokio::sync::watch::Sender;
 
 use crate::server;
 
+// TODO: Recover from screen setting changes
+
 pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("d3d11screencapturesrc")
         .name("source")
@@ -34,21 +36,21 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let convert = gst::ElementFactory::make_with_name("d3d11convert", Some("convert"))?;
     let encoder = gst::ElementFactory::make("nvd3d11h264enc")
         .name("encoder")
-        .property_from_str("aq-strength", "0")
+        .property_from_str("aq-strength", "8")
         .property_from_str("spatial-aq", "true")
         .property_from_str("temporal-aq", "true")
         .property_from_str("zerolatency", "true")
         .property_from_str("repeat-sequence-header", "true")
         .property_from_str("bitrate", "0")
-        .property_from_str("max-bitrate", "50000")
-        .property_from_str("vbv-buffer-size", "50000")
-        .property_from_str("gop-size", "1")
-        // .property_from_str("strict-gop", "true")
+        .property_from_str("max-bitrate", "20000")
+        .property_from_str("vbv-buffer-size", "20000")
+        .property_from_str("gop-size", "5")
+        .property_from_str("strict-gop", "false")
         .property_from_str("bframes", "0")
         .property_from_str("cabac", "false")
         .property_from_str("rc-mode", "3")
         .property_from_str("preset", "8")
-        .property_from_str("tune", "0")
+        .property_from_str("tune", "3")
         .build()?;
     let encoder_filter = gst::ElementFactory::make_with_name("capsfilter", Some("encoder_filter"))?;
     let caps = gst::Caps::builder("video/x-h264")

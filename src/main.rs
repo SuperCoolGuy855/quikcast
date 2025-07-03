@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::sync::LazyLock;
 use std::thread;
 use std::time::SystemTime;
 
@@ -31,6 +32,10 @@ struct Cli {
     ip: Option<String>,
 }
 
+static CLI_ARGS: LazyLock<Cli> = LazyLock::new(|| {
+    Cli::parse()
+});
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     gstreamer::init()?;
@@ -48,12 +53,12 @@ async fn main() -> color_eyre::Result<()> {
         .filter_module("quikcast::client", log::LevelFilter::Debug)
         .init();
 
-    let args = Cli::parse();
+    let args = &CLI_ARGS;
     if args.server {
-        server::start_server(args.port).await?;
+        server::start_server().await?;
     } else if args.client {
-        if let Some(ip) = args.ip {
-            client::start_pipeline(ip, args.port).await?;
+        if args.ip.is_some() {
+            client::start_pipeline().await?;
         } else {
             bail!("Expected IP address!");
         }
