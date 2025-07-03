@@ -5,10 +5,10 @@ use gstreamer::prelude::PluginFeatureExtManual;
 
 use crate::cli::*;
 
+mod cli;
 mod client;
 mod screen_cap;
 mod server;
-mod cli;
 
 static SERVER_ARGS: LazyLock<ServerArgs> = LazyLock::new(|| match CliArgs::parse().command {
     Commands::Server(x) => x,
@@ -32,13 +32,15 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     if cfg!(debug_assertions) {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Debug)
-        // .filter_module("quikcast::server", log::LevelFilter::Trace)
-        .filter_module("quikcast::client", log::LevelFilter::Debug)
-        .init();
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            // .filter_module("quikcast::server", log::LevelFilter::Trace)
+            .filter_module("quikcast::client", log::LevelFilter::Debug)
+            .init();
     } else {
-        env_logger::init();
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .init();
     }
 
     let args = CliArgs::parse();
