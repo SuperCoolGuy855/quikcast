@@ -32,7 +32,7 @@ pub async fn start_server() -> color_eyre::Result<()> {
     }
 }
 
-pub const CHUNK_SIZE: u64 = 1400;
+pub const CHUNK_SIZE: u64 = 1200;
 async fn connection(
     mut stream: TcpStream,
     addr: SocketAddr,

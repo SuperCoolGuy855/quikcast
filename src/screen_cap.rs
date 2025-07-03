@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -9,21 +10,21 @@ use gstreamer_app as gst_app;
 use log::{debug, error, trace, warn};
 use tokio::sync::watch::Sender;
 
-use crate::server;
+use crate::{SERVER_ARGS, server};
 
 // TODO: Recover from screen setting changes
 
 pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("d3d11screencapturesrc")
         .name("source")
-        .property_from_str("capture-api", "0")
-        .property_from_str("monitor-index", "1") // TODO: Dectect bogus index
-        .property_from_str("show-cursor", "true")
+        .property_from_str("capture-api", SERVER_ARGS.capture_api.into())
+        .property("monitor-index", SERVER_ARGS.monitor_index) // TODO: Dectect bogus index
+        .property("show-cursor", !SERVER_ARGS.no_cursor)
         .build()?;
     let capture_filter = gst::ElementFactory::make_with_name("capsfilter", Some("capture_filter"))?;
     let caps = gst::Caps::builder("video/x-raw")
         .features(["memory:D3D11Memory"])
-        .field("framerate", gst::Fraction::new(60, 1))
+        .field("framerate", gst::Fraction::new(SERVER_ARGS.framerate as i32, 1))
         .build();
     capture_filter.set_property("caps", &caps);
     let queue = gst::ElementFactory::make("queue")
@@ -36,20 +37,19 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let convert = gst::ElementFactory::make_with_name("d3d11convert", Some("convert"))?;
     let encoder = gst::ElementFactory::make("nvd3d11h264enc")
         .name("encoder")
-        .property_from_str("aq-strength", "8")
-        .property_from_str("spatial-aq", "true")
-        .property_from_str("temporal-aq", "true")
-        .property_from_str("zerolatency", "true")
-        .property_from_str("repeat-sequence-header", "true")
+        .property("aq-strength", SERVER_ARGS.aq_strength)
+        .property("spatial-aq", !SERVER_ARGS.no_spatial_aq)
+        .property("temporal-aq", !SERVER_ARGS.no_temporal_aq)
+        .property("zerolatency", !SERVER_ARGS.no_zerolatency)
+        .property("repeat-sequence-header", !SERVER_ARGS.no_repeat_header)
         .property_from_str("bitrate", "0")
-        .property_from_str("max-bitrate", "20000")
-        .property_from_str("vbv-buffer-size", "20000")
-        .property_from_str("gop-size", "5")
-        .property_from_str("strict-gop", "false")
+        .property("max-bitrate", SERVER_ARGS.bitrate)
+        .property("vbv-buffer-size", SERVER_ARGS.bitrate)
+        .property("gop-size", SERVER_ARGS.gop_size)
         .property_from_str("bframes", "0")
         .property_from_str("cabac", "false")
-        .property_from_str("rc-mode", "3")
-        .property_from_str("preset", "8")
+        .property_from_str("rc-mode", SERVER_ARGS.rc_mode.into())
+        .property_from_str("preset", SERVER_ARGS.preset.into())
         .property_from_str("tune", "3")
         .build()?;
     let encoder_filter = gst::ElementFactory::make_with_name("capsfilter", Some("encoder_filter"))?;
