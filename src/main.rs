@@ -30,12 +30,16 @@ async fn main() -> color_eyre::Result<()> {
     if let Some(plugin_feature) = registry.lookup_feature("openh264dec") {
         plugin_feature.set_rank(gstreamer::Rank::from(1));
     }
-    
+
+    if cfg!(debug_assertions) {
     env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         // .filter_module("quikcast::server", log::LevelFilter::Trace)
         .filter_module("quikcast::client", log::LevelFilter::Debug)
         .init();
+    } else {
+        env_logger::init();
+    }
 
     let args = CliArgs::parse();
     match args.command {
