@@ -1,16 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::LazyLock;
-use std::thread;
-use std::time::SystemTime;
 
-use clap::{Parser, Subcommand};
-use color_eyre::eyre::bail;
+use clap::{Args, Parser, Subcommand};
 use gstreamer::prelude::PluginFeatureExtManual;
-use itertools::Itertools;
-use log::{debug, info, trace};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::watch::{self, Receiver};
 
 mod client;
 mod screen_cap;
@@ -18,22 +9,45 @@ mod server;
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
-struct Cli {
-    #[arg(short, long)]
-    server: bool,
-
-    #[arg(short, long)]
-    client: bool,
-
-    #[arg(short, long)]
-    port: u16,
-
-    #[arg(short, long)]
-    ip: Option<String>,
+struct CliArgs {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-static CLI_ARGS: LazyLock<Cli> = LazyLock::new(|| {
-    Cli::parse()
+#[derive(Subcommand, Debug, Clone)]
+enum Commands {
+    #[command(about = "Start in server mode")]
+    Server(ServerArgs),
+    #[command(about = "Start in client mode")]
+    Client(ClientArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct ServerArgs {
+    #[arg(short, long, default_value = "18900", help = "TCP port to bind")]
+    port: u16,
+
+    #[arg(short, long, default_value = "0.0.0.0", help = "Optional IP address to bind")]
+    ip: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ClientArgs {
+    #[arg(short, long, default_value = "18900", help = "Server TCP port to connect")]
+    port: u16,
+
+    #[arg(short, long, help = "Server IP address to connect")]
+    ip: String,
+}
+
+static SERVER_ARGS: LazyLock<ServerArgs> = LazyLock::new(|| match CliArgs::parse().command {
+    Commands::Server(x) => x,
+    _ => panic!("Client command not used"),
+});
+
+static CLIENT_ARGS: LazyLock<ClientArgs> = LazyLock::new(|| match CliArgs::parse().command {
+    Commands::Client(x) => x,
+    _ => panic!("Server command not used"),
 });
 
 #[tokio::main]
@@ -53,15 +67,10 @@ async fn main() -> color_eyre::Result<()> {
         .filter_module("quikcast::client", log::LevelFilter::Debug)
         .init();
 
-    let args = &CLI_ARGS;
-    if args.server {
-        server::start_server().await?;
-    } else if args.client {
-        if args.ip.is_some() {
-            client::start_pipeline().await?;
-        } else {
-            bail!("Expected IP address!");
-        }
+    let args = CliArgs::parse();
+    match args.command {
+        Commands::Server { .. } => server::start_server().await?,
+        Commands::Client { .. } => client::start_pipeline().await?,
     }
 
     Ok(())

@@ -100,7 +100,7 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     gst::Element::link_many([
         &source,
         &capture_filter,
-        // &queue,
+        &queue,
         &convert,
         &encoder,
         &encoder_filter,

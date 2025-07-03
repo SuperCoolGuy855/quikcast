@@ -15,7 +15,7 @@ use tokio::sync::watch;
 
 use itertools::Itertools;
 
-use crate::{server, CLI_ARGS};
+use crate::{CLIENT_ARGS, server};
 
 // TODO: Shutdown when windows is closed
 pub async fn start_pipeline() -> color_eyre::Result<()> {
@@ -132,9 +132,7 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         });
     }
 
-    let ip = CLI_ARGS.ip.as_ref().expect("Checked by main function");
-    let port = CLI_ARGS.port;
-    let mut stream = TcpStream::connect(format!("{ip}:{port}")).await?;
+    let mut stream = TcpStream::connect(format!("{}:{}", CLIENT_ARGS.ip, CLIENT_ARGS.port)).await?;
     info!(
         "Connected to server {} with {}",
         stream.peer_addr().unwrap(),
