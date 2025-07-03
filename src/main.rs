@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::bail;
+use gstreamer::prelude::PluginFeatureExtManual;
 use itertools::Itertools;
 use log::{debug, info, trace};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,10 +34,18 @@ struct Cli {
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     gstreamer::init()?;
+
+    // Lower priority of openh264dec because I can't deal with openh264 anymore
+    // Get the default registry
+    let registry = gstreamer::Registry::get();
+    if let Some(plugin_feature) = registry.lookup_feature("openh264dec") {
+        plugin_feature.set_rank(gstreamer::Rank::from(1));
+    }
+
     env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         // .filter_module("quikcast::server", log::LevelFilter::Trace)
-        // .filter_module("quikcast::client", log::LevelFilter::Trace)
+        .filter_module("quikcast::client", log::LevelFilter::Debug)
         .init();
 
     let args = Cli::parse();

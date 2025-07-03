@@ -9,19 +9,21 @@ use gstreamer_app as gst_app;
 use log::{debug, error, trace, warn};
 use tokio::sync::watch::Sender;
 
+use crate::server;
+
 pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("d3d11screencapturesrc")
         .name("source")
         .property_from_str("capture-api", "0")
-        .property_from_str("monitor-index", "0") // TODO: Dectect bogus index
+        .property_from_str("monitor-index", "1") // TODO: Dectect bogus index
         .property_from_str("show-cursor", "true")
         .build()?;
-    let capsfilter = gst::ElementFactory::make_with_name("capsfilter", Some("rate_filter"))?;
+    let capture_filter = gst::ElementFactory::make_with_name("capsfilter", Some("capture_filter"))?;
     let caps = gst::Caps::builder("video/x-raw")
         .features(["memory:D3D11Memory"])
         .field("framerate", gst::Fraction::new(60, 1))
         .build();
-    capsfilter.set_property("caps", &caps);
+    capture_filter.set_property("caps", &caps);
     let queue = gst::ElementFactory::make("queue")
         .name("queue")
         .property_from_str("max-size-buffers", "1")
@@ -32,22 +34,44 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     let convert = gst::ElementFactory::make_with_name("d3d11convert", Some("convert"))?;
     let encoder = gst::ElementFactory::make("nvd3d11h264enc")
         .name("encoder")
-        .property_from_str("aq-strength", "3")
+        .property_from_str("aq-strength", "0")
         .property_from_str("spatial-aq", "true")
         .property_from_str("temporal-aq", "true")
         .property_from_str("zerolatency", "true")
         .property_from_str("repeat-sequence-header", "true")
         .property_from_str("bitrate", "0")
-        .property_from_str("max-bitrate", "20000")
-        .property_from_str("vbv-buffer-size", "20000")
-        .property_from_str("gop-size", "10")
-        .property_from_str("rc-mode", "2")
+        .property_from_str("max-bitrate", "50000")
+        .property_from_str("vbv-buffer-size", "50000")
+        .property_from_str("gop-size", "1")
+        // .property_from_str("strict-gop", "true")
+        .property_from_str("bframes", "0")
+        .property_from_str("cabac", "false")
+        .property_from_str("rc-mode", "3")
         .property_from_str("preset", "8")
-        .property_from_str("tune", "3")
+        .property_from_str("tune", "0")
         .build()?;
+    let encoder_filter = gst::ElementFactory::make_with_name("capsfilter", Some("encoder_filter"))?;
+    let caps = gst::Caps::builder("video/x-h264")
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
+        // .field("profile", "main")
+        .build();
+    encoder_filter.set_property("caps", &caps);
     let parser = gst::ElementFactory::make("h264parse")
         .name("parser")
         .property_from_str("config-interval", "-1")
+        .build()?;
+    let parser_filter = gst::ElementFactory::make_with_name("capsfilter", Some("parser_filter"))?;
+    let caps = gst::Caps::builder("video/x-h264")
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
+        .build();
+    parser_filter.set_property("caps", &caps);
+    let payload = gst::ElementFactory::make("rtph264pay")
+        .name("payload")
+        .property_from_str("config-interval", "1")
+        .property_from_str("aggregate-mode", "0")
+        .property_from_str("mtu", &server::CHUNK_SIZE.to_string())
         .build()?;
     let sink = gst::ElementFactory::make("appsink")
         .name("sink")
@@ -60,21 +84,27 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
 
     pipeline.add_many([
         &source,
-        &capsfilter,
+        &capture_filter,
         &queue,
         &convert,
         &encoder,
+        &encoder_filter,
         &parser,
+        &parser_filter,
+        &payload,
         &sink,
     ])?;
 
     gst::Element::link_many([
         &source,
-        &capsfilter,
-        &queue,
+        &capture_filter,
+        // &queue,
         &convert,
         &encoder,
+        &encoder_filter,
         &parser,
+        &parser_filter,
+        // &payload,
         &sink,
     ])?;
 
@@ -138,6 +168,7 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
     debug!("Screen capture started!");
 
     std::thread::spawn(move || {
+        // let mut index_num = 0_u64;
         while let Ok(sample) = app_sink.pull_sample() {
             if let Some(buffer) = sample.buffer() {
                 let map = buffer.map_readable().unwrap();
@@ -148,12 +179,15 @@ pub fn start_pipeline(tx: Sender<Vec<u8>>) -> color_eyre::Result<()> {
 
                 let lat = latency.load(Ordering::Acquire);
                 let mut data = lat.to_be_bytes().to_vec();
+                // data.extend_from_slice(&index_num.to_be_bytes());
                 data.extend_from_slice(&map);
+
                 if tx.send(data).is_err() {
-                    break; // All receivers dropped
+                    break;
                 }
                 trace!("Frame sent!");
             }
+            // index_num += 1;
         }
     });
 

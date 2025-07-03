@@ -15,10 +15,13 @@ use tokio::sync::watch;
 
 use itertools::Itertools;
 
+use crate::server;
+
+// TODO: Shutdown when windows is closed
 pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
-        .property_from_str("emit-signals", "true")
+        .property_from_str("emit-signals", "false")
         .property_from_str("is-live", "true")
         .property_from_str("leaky-type", "2")
         .property_from_str("max-buffers", "1")
@@ -26,9 +29,24 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
         .property_from_str("format", "time")
         .property_from_str("do-timestamp", "true")
         .build()?;
-    let caps = gst::Caps::builder("video/x-h264").build();
+    // let caps = gst::Caps::builder("application/x-rtp")
+    //     .field("clock-rate", 90000_i32)
+    //     .field("encoding-name", "H264")
+    //     .field("media", "video")
+    //     .build();
+    let caps = gst::Caps::builder("video/x-h264")
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
+        .build();
     source.set_property("caps", &caps);
-    let parser = gst::ElementFactory::make_with_name("h264parse", Some("parser"))?;
+    let payload = gst::ElementFactory::make("rtph264depay")
+        .name("payload")
+        .build()?;
+    let parser = gst::ElementFactory::make("h264parse")
+        .name("parser")
+        // .property_from_str("disable-passthrough", "true")
+        // .property_from_str("config-interval", "-1")
+        .build()?;
     let decoder = gst::ElementFactory::make("decodebin")
         .name("decoder")
         .property_from_str("max-size-buffers", "1")
@@ -40,9 +58,12 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
         .build()?;
 
     let pipeline = gst::Pipeline::with_name("decoding");
-    pipeline.add_many([&source, &parser, &decoder, &convert, &sink])?;
+    pipeline.add_many([&source, &payload, &parser, &decoder, &convert, &sink])?;
 
-    gst::Element::link_many([&source, &parser, &decoder])?;
+    gst::Element::link_many([
+        &source, // &payload,
+        &parser, &decoder,
+    ])?;
     gst::Element::link_many([&convert, &sink])?;
 
     decoder.connect_pad_added(move |src, src_pad| {
@@ -132,6 +153,9 @@ pub async fn start_pipeline(ip: String, port: u16) -> color_eyre::Result<()> {
                     warn!("EOS detected! {e:?}");
                     break;
                 }
+                MessageView::Warning(w) => {
+                    warn!("Gstreamer warning: {w:?}");
+                }
                 _ => (),
             }
         }
@@ -168,7 +192,12 @@ async fn frame_receive(
     let mut cur_encoding_latency = 0;
     let mut cur_network_start = 0;
     let mut data = vec![];
-    let mut buf = [0; 1250];
+    let mut buf = [0; server::CHUNK_SIZE as usize + 50];
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("client.h264").await?;
 
     loop {
         let size = socket.recv(&mut buf).await?;
@@ -176,6 +205,12 @@ async fn frame_receive(
         match buf[0] {
             255 => {
                 if !data.is_empty() {
+                    if data.len() as u64 != cur_total_size {
+                        warn!("Incomplete data pushed!");
+                    }
+                    // println!("{cur_seq_num} {}", data.len());
+                    file.write_all(&data).await?;
+
                     let mut buffer = gst::Buffer::with_size(data.len())?;
                     {
                         let mut map = buffer.get_mut().unwrap().map_writable()?;
@@ -213,14 +248,17 @@ async fn frame_receive(
             }
             254 => {
                 let seq_num = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                // println!("{seq_num} {}", size);
                 if seq_num == cur_seq_num {
                     data.extend_from_slice(&buf[9..size]);
+                } else {
+                    warn!("Out of order data! {seq_num}");
                 }
             }
             _ => (),
         }
         if data.len() > cur_total_size as usize {
-            debug!("Data full!");
+            warn!("Data full!");
             let mut buffer = gst::Buffer::with_size(data.len())?;
             {
                 let mut map = buffer.get_mut().unwrap().map_writable()?;
