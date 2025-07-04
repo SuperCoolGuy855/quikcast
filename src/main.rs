@@ -31,11 +31,13 @@ async fn main() -> color_eyre::Result<()> {
         plugin_feature.set_rank(gstreamer::Rank::from(1));
     }
 
-    if cfg!(debug_assertions) {
+    let args = CliArgs::parse();
+
+    if cfg!(debug_assertions) || args.logs {
         env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             // .filter_module("quikcast::server", log::LevelFilter::Trace)
-            .filter_module("quikcast::client", log::LevelFilter::Debug)
+            // .filter_module("quikcast::client", log::LevelFilter::Debug)
             .init();
     } else {
         env_logger::builder()
@@ -43,7 +45,6 @@ async fn main() -> color_eyre::Result<()> {
             .init();
     }
 
-    let args = CliArgs::parse();
     match args.command {
         Commands::Server { .. } => server::start_server().await?,
         Commands::Client { .. } => client::start_pipeline().await?,

@@ -3,6 +3,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct CliArgs {
+    #[arg(short, long, help = "Enable debug logging")]
+    pub logs: bool,
     #[command(subcommand)]
     pub command: Commands,
 }

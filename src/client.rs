@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch::{Receiver, Sender};
+use tokio::time::Instant;
 
 use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
@@ -205,36 +206,38 @@ async fn frame_receive(
     let mut buf = [0; server::CHUNK_SIZE as usize + 50];
 
     loop {
+        if data.len() as u64 >= cur_total_size {
+            let mut buffer = gst::Buffer::with_size(data.len())?;
+            {
+                let mut map = buffer.get_mut().unwrap().map_writable()?;
+                map.as_mut_slice().copy_from_slice(&data);
+            }
+            app_src.push_buffer(buffer)?;
+            trace!("Frame pushed!");
+
+            let network_end_time = {
+                let time = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                time.as_nanos() as u64
+            };
+
+            let encoding_latency = Duration::from_nanos(cur_encoding_latency);
+            let network_latency = Duration::from_nanos(network_end_time - cur_network_start);
+
+            tx.send((encoding_latency, network_latency))?;
+
+            data.clear();
+            cur_seq_num += 1;
+        }
+
         let size = socket.recv(&mut buf).await?;
         trace!("Data received!");
+
         match buf[0] {
             255 => {
                 if !data.is_empty() {
-                    if data.len() as u64 != cur_total_size {
-                        warn!("Incomplete data pushed!");
-                    }
-
-                    let mut buffer = gst::Buffer::with_size(data.len())?;
-                    {
-                        let mut map = buffer.get_mut().unwrap().map_writable()?;
-                        map.as_mut_slice().copy_from_slice(&data);
-                    }
-                    app_src.push_buffer(buffer)?;
-                    trace!("Frame sent!");
-
-                    let network_end_time = {
-                        let time = SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap();
-                        time.as_nanos() as u64
-                    };
-
-                    let encoding_latency = Duration::from_nanos(cur_encoding_latency);
-                    let network_latency =
-                        Duration::from_nanos(network_end_time - cur_network_start);
-
-                    tx.send((encoding_latency, network_latency))?;
-
+                    warn!("Incomplete data pushed!");
                     data.clear();
                 }
                 let (encoding_latency, network_start_time, seq_num, total_size) = buf[1..size]
@@ -242,7 +245,7 @@ async fn frame_receive(
                     .map(|x| u64::from_be_bytes(x.try_into().unwrap()))
                     .collect_tuple()
                     .unwrap();
-                if cur_seq_num < seq_num {
+                if cur_seq_num <= seq_num {
                     cur_seq_num = seq_num;
                     cur_total_size = total_size;
                     cur_encoding_latency = encoding_latency;
@@ -259,33 +262,6 @@ async fn frame_receive(
                 }
             }
             _ => (),
-        }
-        if data.len() > cur_total_size as usize {
-            warn!("Data full!");
-            let mut buffer = gst::Buffer::with_size(data.len())?;
-            {
-                let mut map = buffer.get_mut().unwrap().map_writable()?;
-                map.as_mut_slice().copy_from_slice(&data);
-            }
-            app_src.push_buffer(buffer)?;
-
-            let network_end_time = {
-                let time = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap();
-                time.as_nanos() as u64
-            };
-
-            let encoding_latency = Duration::from_nanos(cur_encoding_latency);
-            let network_latency = Duration::from_nanos(network_end_time - cur_network_start);
-
-            tx.send((encoding_latency, network_latency))?;
-
-            data.clear();
-
-            cur_total_size = 0;
-            cur_seq_num = 0;
-            cur_encoding_latency = 0;
         }
     }
 }
