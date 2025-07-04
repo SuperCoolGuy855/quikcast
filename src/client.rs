@@ -203,12 +203,6 @@ async fn frame_receive(
     let mut cur_network_start = 0;
     let mut data = vec![];
     let mut buf = [0; server::CHUNK_SIZE as usize + 50];
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("client.h264")
-        .await?;
 
     loop {
         let size = socket.recv(&mut buf).await?;
@@ -219,8 +213,6 @@ async fn frame_receive(
                     if data.len() as u64 != cur_total_size {
                         warn!("Incomplete data pushed!");
                     }
-                    // println!("{cur_seq_num} {}", data.len());
-                    file.write_all(&data).await?;
 
                     let mut buffer = gst::Buffer::with_size(data.len())?;
                     {
