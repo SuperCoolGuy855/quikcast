@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::select;
 use tokio::sync::watch::{Receiver, Sender};
 use tokio::time::Instant;
 
@@ -18,7 +19,6 @@ use itertools::Itertools;
 
 use crate::{CLIENT_ARGS, server};
 
-// TODO: Shutdown when windows is closed
 pub async fn start_pipeline() -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
@@ -78,7 +78,7 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
             for element in decodebin.iterate_elements().into_iter().flatten() {
                 if let Some(factory) = element.factory() {
                     if factory.klass().contains("Decoder") {
-                        debug!("Selected decoder: {}", factory.name());
+                        info!("Selected decoder: {}", factory.name());
                     }
                 }
             }
@@ -86,6 +86,16 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
 
         src_pad.link(&convert_pad).unwrap();
     });
+
+    if let Some(sink_bin) = sink.downcast_ref::<gst::Bin>() {
+        sink_bin.connect_element_added(|bin, added| {
+            if let Some(factory) = added.factory() {
+                if factory.klass().contains("Video") {
+                    added.set_property("fullscreen", true);
+                }
+            }
+        });
+    }
 
     pipeline.set_state(gst::State::Playing)?;
 
@@ -147,12 +157,8 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
 
     let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
 
-    tokio::spawn(async {
-        frame_receive(app_src, socket, tx).await.unwrap();
-    });
-
     let bus = pipeline.bus().unwrap();
-    std::thread::spawn(move || {
+    let bus_handle = tokio::task::spawn_blocking(move || {
         for msg in bus.iter_timed(None) {
             use gst::MessageView;
             match msg.view() {
@@ -172,6 +178,18 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         }
     });
 
+    select! {
+        Err(_e) = heartbeat(stream) => {}
+        _ = bus_handle => {}
+        Err(e) = frame_receive(app_src, socket, tx) => {error!("Can't receive frame: {e}");}
+    };
+
+    pipeline.set_state(gst::State::Null)?;
+
+    Ok(())
+}
+
+async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
     loop {
         match tokio::time::timeout(Duration::from_millis(1000), stream.read_u64()).await {
             Ok(Ok(x)) => {
@@ -187,10 +205,6 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
             }
         }
     }
-
-    pipeline.set_state(gst::State::Null)?;
-
-    Ok(())
 }
 
 async fn frame_receive(
