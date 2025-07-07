@@ -4,7 +4,7 @@ use std::{
 };
 
 use itertools::Itertools;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -15,7 +15,12 @@ use crate::{SERVER_ARGS, screen_cap};
 
 pub async fn start_server() -> color_eyre::Result<()> {
     let listener = TcpListener::bind(format!("{}:{}", SERVER_ARGS.ip, SERVER_ARGS.port)).await?;
-    info!("TCP server started on {}", listener.local_addr().unwrap());
+    info!(
+        "TCP server started on {}",
+        listener
+            .local_addr()
+            .expect("Expected to have IP after binding")
+    );
 
     let (tx, rx) = watch::channel(vec![]);
 
@@ -23,7 +28,13 @@ pub async fn start_server() -> color_eyre::Result<()> {
     debug!("Screen capture starting!");
 
     loop {
-        let (stream, addr) = listener.accept().await.unwrap();
+        let (stream, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                error!("Unable to accept incoming connection: {e}");
+                continue;
+            },
+        };
         debug!("New connection: {addr}");
         let rx_clone = rx.clone();
         tokio::spawn(connection(stream, addr, rx_clone));
@@ -45,7 +56,7 @@ async fn connection(
 
     info!(
         "Connected UDP to {} with {}",
-        socket.local_addr().unwrap(),
+        socket.local_addr().expect("Expected to have IP after binding"),
         udp_addr
     );
 
@@ -95,7 +106,7 @@ async fn send_frame(socket: UdpSocket, mut rx: Receiver<Vec<u8>>) -> color_eyre:
         let network_start_time = {
             let time = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap();
+                .unwrap_or_default(); // TODO: Check if this is good
             time.as_nanos() as u64
         };
 
