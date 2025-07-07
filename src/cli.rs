@@ -99,6 +99,9 @@ pub struct ClientArgs {
         help = "Server TCP port to connect"
     )]
     pub port: u16,
+
+    #[arg(long, help = "*Try* to enable fullscreen")]
+    pub fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

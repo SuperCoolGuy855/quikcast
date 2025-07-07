@@ -1,6 +1,8 @@
+#![warn(clippy::unwrap_used)]
+
 use std::sync::LazyLock;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser};
 use gstreamer::prelude::PluginFeatureExtManual;
 
 use crate::cli::*;

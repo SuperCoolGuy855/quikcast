@@ -1,19 +1,16 @@
 use log::{debug, error, info, trace, warn};
-use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::select;
-use tokio::sync::watch::{Receiver, Sender};
-use tokio::time::Instant;
+use tokio::sync::watch::Sender;
 
 use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
-use gstreamer::{self as gst, MessageView};
+use gstreamer::{self as gst};
 use gstreamer_app::{self as gst_app, AppSrc};
-use tokio::sync::watch;
 
 use itertools::Itertools;
 
@@ -68,7 +65,10 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
     gst::Element::link_many([&convert, &sink])?;
 
     decoder.connect_pad_added(move |src, src_pad| {
-        let convert_pad = convert.static_pad("sink").unwrap();
+        let convert_pad = match convert.static_pad("sink") {
+            Some(x) => x,
+            None => panic!("Unable to get the sink pad from videoconvert element"),
+        };
 
         if convert_pad.is_linked() {
             return;
@@ -84,11 +84,16 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
             }
         }
 
-        src_pad.link(&convert_pad).unwrap();
+        match src_pad.link(&convert_pad) {
+            Ok(_) => (),
+            Err(e) => panic!("Unable to link decodebin src pad with videoconvert sink pad: {e}"),
+        }
     });
 
-    if let Some(sink_bin) = sink.downcast_ref::<gst::Bin>() {
-        sink_bin.connect_element_added(|bin, added| {
+    if CLIENT_ARGS.fullscreen
+        && let Some(sink_bin) = sink.downcast_ref::<gst::Bin>()
+    {
+        sink_bin.connect_element_added(|_bin, added| {
             if let Some(factory) = added.factory() {
                 if factory.klass().contains("Video") {
                     added.set_property("fullscreen", true);
@@ -106,48 +111,56 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
     let clock = loop {
         match pipeline.clock() {
             Some(clock) => break clock,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+            None => std::thread::sleep(std::time::Duration::from_millis(50)), // FIXME: This is stupid
         }
     };
 
-    let src_pad = source.static_pad("src").unwrap();
+    if let Some(src_pad) = source.static_pad("src")
+        && let Some(sink_pad) = sink.static_pad("sink")
     {
-        let latency_start = Arc::clone(&latency_start);
-        let clock = clock.clone();
+        {
+            let latency_start = Arc::clone(&latency_start);
+            let clock = clock.clone();
 
-        src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-            if info.buffer().is_some() {
-                let now = clock.time().unwrap();
-                // *latency_start.lock().unwrap() = now.into();
-                latency_start.store(now.into(), Ordering::Release);
-                trace!("Captured at: {:?}", now);
-            }
-            gst::PadProbeReturn::Ok
-        });
-    }
+            src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if info.buffer().is_some() {
+                    let now = clock
+                        .time()
+                        .expect("Gstreamer Pipeline Clock should always have a time");
+                    // *latency_start.lock().unwrap() = now.into();
+                    latency_start.store(now.into(), Ordering::Release);
+                    trace!("Captured at: {now:?}");
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
 
-    let sink_pad = sink.static_pad("sink").unwrap();
-    {
-        let latency_start = latency_start.clone();
-        let clock = clock.clone();
-        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-            let now: u64 = clock.time().unwrap().into();
-            let start_time = latency_start.load(Ordering::Acquire);
-            let diff = now - start_time;
-            trace!("Latency: {} ms", diff as f64 / 1_000_000.0);
-            let decoding_latency = Duration::from_nanos(diff);
-            let (encoding_latency, network_latency) = *rx.borrow();
-            let total = encoding_latency + decoding_latency + network_latency;
-            debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
-            gst::PadProbeReturn::Ok
-        });
+        {
+            let latency_start = latency_start.clone();
+            let clock = clock.clone();
+            sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                let now: u64 = clock.time().expect("Gstreamer Pipeline Clock should always have a time").into();
+                let start_time = latency_start.load(Ordering::Acquire);
+                let diff = now - start_time;
+                trace!("Latency: {} ms", diff as f64 / 1_000_000.0);
+                let decoding_latency = Duration::from_nanos(diff);
+                let (encoding_latency, network_latency) = *rx.borrow();
+                let total = encoding_latency + decoding_latency + network_latency;
+                debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
+                gst::PadProbeReturn::Ok
+            });
+        }
     }
 
     let mut stream = TcpStream::connect(format!("{}:{}", CLIENT_ARGS.ip, CLIENT_ARGS.port)).await?;
     info!(
         "Connected to server {} with {}",
-        stream.peer_addr().unwrap(),
-        stream.local_addr().unwrap()
+        stream
+            .peer_addr()
+            .expect("TcpStream is connected and should have a peer address"),
+        stream
+            .local_addr()
+            .expect("TcpStream is connected and should have a local address")
     );
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -155,9 +168,12 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
 
     stream.write_u16(udp_port).await?;
 
-    let app_src = source.downcast::<gst_app::AppSrc>().unwrap();
+    let app_src = match source.downcast::<gst_app::AppSrc>() {
+        Ok(x) => x,
+        Err(_) => panic!("Can't cast appsrc element to AppSrc struct"),
+    };
 
-    let bus = pipeline.bus().unwrap();
+    let bus = pipeline.bus().wrap_err("Unable to get pipeline's bus")?;
     let bus_handle = tokio::task::spawn_blocking(move || {
         for msg in bus.iter_timed(None) {
             use gst::MessageView;
@@ -196,7 +212,7 @@ async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
                 trace!("Server heartbeat: {x}");
             }
             Ok(Err(e)) => {
-                error!("Server disconnected: {}", e);
+                error!("Server disconnected: {e}");
                 bail!(e);
             }
             Err(_) => {
@@ -223,16 +239,17 @@ async fn frame_receive(
         if data.len() as u64 >= cur_total_size {
             let mut buffer = gst::Buffer::with_size(data.len())?;
             {
-                let mut map = buffer.get_mut().unwrap().map_writable()?;
+                let mut map = buffer
+                    .get_mut()
+                    .wrap_err("Unable to get mutable buffer")?
+                    .map_writable()?;
                 map.as_mut_slice().copy_from_slice(&data);
             }
             app_src.push_buffer(buffer)?;
             trace!("Frame pushed!");
 
             let network_end_time = {
-                let time = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap();
+                let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
                 time.as_nanos() as u64
             };
 
@@ -256,9 +273,14 @@ async fn frame_receive(
                 }
                 let (encoding_latency, network_start_time, seq_num, total_size) = buf[1..size]
                     .chunks(8)
-                    .map(|x| u64::from_be_bytes(x.try_into().unwrap()))
+                    .map(|x| {
+                        u64::from_be_bytes(
+                            x.try_into()
+                                .expect("Number of bytes is checked by chunks()"),
+                        )
+                    })
                     .collect_tuple()
-                    .unwrap();
+                    .wrap_err("Incorrect number of u64")?;
                 if cur_seq_num <= seq_num {
                     cur_seq_num = seq_num;
                     cur_total_size = total_size;
@@ -267,7 +289,11 @@ async fn frame_receive(
                 }
             }
             254 => {
-                let seq_num = u64::from_be_bytes(buf[1..9].try_into().unwrap());
+                let seq_num = u64::from_be_bytes(
+                    buf[1..9]
+                        .try_into()
+                        .expect("Number of bytes is checked by range"),
+                );
                 // println!("{seq_num} {}", size);
                 if seq_num == cur_seq_num {
                     data.extend_from_slice(&buf[9..size]);

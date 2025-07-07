@@ -3,14 +3,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::bail;
 use itertools::Itertools;
 use log::{debug, info, trace, warn};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::watch::{self, Receiver, Sender},
-    time::Instant,
+    sync::watch::{self, Receiver},
 };
 
 use crate::{SERVER_ARGS, screen_cap};
@@ -36,7 +34,7 @@ pub const CHUNK_SIZE: u64 = 1200;
 async fn connection(
     mut stream: TcpStream,
     addr: SocketAddr,
-    mut rx: Receiver<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
 ) -> color_eyre::Result<()> {
     let udp_port = stream.read_u16().await?;
 

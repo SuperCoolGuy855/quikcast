@@ -1,11 +1,8 @@
-use std::io::Write;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 
-use color_eyre::eyre::{ContextCompat, bail};
 use gstreamer::prelude::*;
-use gstreamer::{self as gst, MessageView};
+use gstreamer::{self as gst};
 use gstreamer_app as gst_app;
 use log::{debug, error, trace, warn};
 use tokio::sync::watch::Sender;
