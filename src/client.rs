@@ -90,19 +90,20 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         }
     });
 
-    if CLIENT_ARGS.fullscreen
-        && let Some(sink_bin) = sink.downcast_ref::<gst::Bin>()
-    {
-        sink_bin.connect_element_added(|_bin, added| {
-            if let Some(factory) = added.factory() {
-                if factory.klass().contains("Video") {
-                    added.set_property("fullscreen", true);
-                }
-            }
-        });
-    }
-
     pipeline.set_state(gst::State::Playing)?;
+
+    let bus = pipeline.bus().wrap_err("Unable to get pipeline's bus")?;
+
+    // Windows handle
+
+    for msg in bus.iter_timed(None) {
+        use gst::MessageView;
+        if let MessageView::NewClock(x) = msg.view() {
+            let clock = x.clock().expect("There should be a clock");
+            debug!("Pipeline acquired clock: {:?}", clock.name());
+            break;
+        }
+    }
 
     let (tx, rx) = tokio::sync::watch::channel(Default::default());
 
@@ -146,7 +147,12 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
                 let decoding_latency = Duration::from_nanos(diff);
                 let (encoding_latency, network_latency) = *rx.borrow();
                 let total = encoding_latency + decoding_latency + network_latency;
-                debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
+                if CLIENT_ARGS.latency_log {
+                    info!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
+                } 
+                // else {
+                //     debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
+                // }
                 gst::PadProbeReturn::Ok
             });
         }
@@ -173,8 +179,7 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         Err(_) => panic!("Can't cast appsrc element to AppSrc struct"),
     };
 
-    let bus = pipeline.bus().wrap_err("Unable to get pipeline's bus")?;
-    let bus_handle = tokio::task::spawn_blocking(move || {
+    let message_monitor_handle = tokio::task::spawn_blocking(move || {
         for msg in bus.iter_timed(None) {
             use gst::MessageView;
             match msg.view() {
@@ -195,13 +200,16 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
     });
 
     select! {
-        Err(_e) = heartbeat(stream) => {}
-        _ = bus_handle => {}
+        Err(e) = heartbeat(stream) => {error!("{e}")}
+        _ = message_monitor_handle => {}
         Err(e) = frame_receive(app_src, socket, tx) => {error!("Can't receive frame: {e}");}
     };
 
+    
     pipeline.set_state(gst::State::Null)?;
-
+    
+    println!("Pipeline set null");
+    
     Ok(())
 }
 
@@ -212,12 +220,10 @@ async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
                 trace!("Server heartbeat: {x}");
             }
             Ok(Err(e)) => {
-                error!("Server disconnected: {e}");
-                bail!(e);
+                bail!("Server disconnected: {e}");
             }
             Err(_) => {
-                error!("Server heartbeat timeout - server likely dead");
-                bail!("Heartbeat timeout!");
+                bail!("Server heartbeat timeout - server likely dead");
             }
         }
     }
