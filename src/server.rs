@@ -24,7 +24,7 @@ pub async fn start_server() -> color_eyre::Result<()> {
 
     let (tx, rx) = watch::channel(vec![]);
 
-    std::thread::spawn(move || screen_cap::start_pipeline(tx));
+    std::thread::spawn(move || screen_cap::start_pipeline(tx)); // TODO: Crash when this crash
     debug!("Screen capture starting!");
 
     loop {
@@ -46,13 +46,30 @@ async fn connection(
     mut stream: TcpStream,
     addr: SocketAddr,
     rx: Receiver<Vec<u8>>,
-) -> color_eyre::Result<()> {
-    let udp_port = stream.read_u16().await?;
+) {
+    let udp_port = match stream.read_u16().await {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("Can't get udp port from client: {e}");
+            return;
+        },
+    };
 
     let mut udp_addr = addr;
     udp_addr.set_port(udp_port);
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.connect(udp_addr).await?;
+
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("Can't bind UdpSocket: {e}");
+            return;
+        },
+    };
+
+    if let Err(e) = socket.connect(udp_addr).await {
+        warn!("Can't connect UDP to {udp_addr}: {e}");
+        return;
+    }
 
     info!(
         "Connected UDP to {} with {}",
@@ -61,11 +78,9 @@ async fn connection(
     );
 
     tokio::select! {
-        _ = send_frame(socket, rx) => (), // TODO: Error checking
+        color_eyre::Result::Err(e) = send_frame(socket, rx) => {warn!("Unable to send data/frame to client {addr}: {e}")},
         color_eyre::Result::Err(e) = heartbeat(stream) => {warn!("Client {addr} disconnected: {e}");}
     }
-
-    Ok(())
 }
 
 async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
