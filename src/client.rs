@@ -179,7 +179,10 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         Err(_) => panic!("Can't cast appsrc element to AppSrc struct"),
     };
 
-    let message_monitor_handle = tokio::task::spawn_blocking(move || {
+    let noti = Arc::new(tokio::sync::Notify::new());
+    let noti2 = noti.clone();
+
+    std::thread::spawn(move || {
         for msg in bus.iter_timed(None) {
             use gst::MessageView;
             match msg.view() {
@@ -197,18 +200,17 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
                 _ => (),
             }
         }
+        noti2.notify_one();
     });
 
     select! {
         Err(e) = heartbeat(stream) => {error!("{e}")}
-        _ = message_monitor_handle => {}
         Err(e) = frame_receive(app_src, socket, tx) => {error!("Can't receive frame: {e}");}
+        _ = noti.notified() => (),
     };
 
     
     pipeline.set_state(gst::State::Null)?;
-    
-    println!("Pipeline set null");
     
     Ok(())
 }
