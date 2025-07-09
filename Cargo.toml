@@ -9,7 +9,9 @@ color-eyre = "0.6.5"
 env_logger = "0.11.8"
 gstreamer = "0.23.7"
 gstreamer-app = "0.23.5"
+gstreamer-video = "0.23.6"
 itertools = "0.14.0"
 log = "0.4.27"
 rand = "0.9.1"
 tokio = { version = "1.46.1", features = ["full"] }
+winit = { version = "0.30.11", features = ["rwh_06"] }

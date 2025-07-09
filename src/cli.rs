@@ -100,8 +100,8 @@ pub struct ClientArgs {
     )]
     pub port: u16,
 
-    #[arg(long, help = "*Try* to enable fullscreen")]
-    pub fullscreen: bool,
+    #[arg(short, long="latency", help = "Enable latency logger")]
+    pub latency_log: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

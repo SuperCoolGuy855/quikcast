@@ -49,7 +49,7 @@ async fn main() -> color_eyre::Result<()> {
 
     match args.command {
         Commands::Server { .. } => server::start_server().await?,
-        Commands::Client { .. } => client::start_pipeline().await?,
+        Commands::Client { .. } => client::start_client().await?,
     }
 
     Ok(())

@@ -96,7 +96,7 @@ async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
 }
 
 async fn send_frame(socket: UdpSocket, mut rx: Receiver<Vec<u8>>) -> color_eyre::Result<()> {
-    let mut seq_num: u64 = 1;
+    let mut seq_num: u64 = 1; // This start as one for tracking purpose
     // let mut prev_index_num = None;
     loop {
         // let start_time = Instant::now();

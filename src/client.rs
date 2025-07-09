@@ -1,22 +1,46 @@
 use log::{debug, error, info, trace, warn};
+use std::f32::DIGITS;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::select;
-use tokio::sync::watch::Sender;
+use tokio::sync::{Notify, oneshot, watch};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::EventLoop;
+use winit::raw_window_handle::HasWindowHandle;
+use winit::window::Window;
 
 use color_eyre::eyre::{ContextCompat, bail};
+use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer::{self as gst};
 use gstreamer_app::{self as gst_app, AppSrc};
-
+use gstreamer_video::prelude::VideoOverlayExtManual;
 use itertools::Itertools;
 
 use crate::{CLIENT_ARGS, server};
 
-pub async fn start_pipeline() -> color_eyre::Result<()> {
+pub async fn start_client() -> color_eyre::Result<()> {
+    let (tx, rx) = oneshot::channel();
+    let finish_noti = Arc::new(Notify::new());
+    let noti_clone = finish_noti.clone();
+
+    let pipeline_handle = tokio::spawn(start_pipeline(rx, noti_clone));
+
+    create_window(tx)?;
+
+    finish_noti.notify_waiters();
+
+    pipeline_handle.await??;
+    Ok(())
+}
+
+pub async fn start_pipeline(
+    rx: oneshot::Receiver<usize>,
+    noti: Arc<Notify>,
+) -> color_eyre::Result<()> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
         .property_from_str("emit-signals", "false")
@@ -90,11 +114,31 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         }
     });
 
-    pipeline.set_state(gst::State::Playing)?;
+    // Windows handle
+    let window_id = rx.await?;
 
+    pipeline.set_state(gst::State::Playing)?;
     let bus = pipeline.bus().wrap_err("Unable to get pipeline's bus")?;
 
-    // Windows handle
+    bus.set_sync_handler(move |_bus, msg| {
+        use gst::MessageView;
+        if let MessageView::Element(e) = msg.view() {
+            if let Some(structure) = e.structure() {
+                if structure.name() == "prepare-window-handle" {
+                    if let Some(msg_src) = msg.src()
+                        && let Some(overlay) =
+                            msg_src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+                    {
+                        unsafe {
+                            overlay.set_window_handle(window_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        gst::BusSyncReply::Pass
+    });
 
     for msg in bus.iter_timed(None) {
         use gst::MessageView;
@@ -105,16 +149,11 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         }
     }
 
-    let (tx, rx) = tokio::sync::watch::channel(Default::default());
+    let (tx, rx) = watch::channel(Default::default());
 
     // Latency pad probes
     let latency_start = Arc::new(AtomicU64::new(0));
-    let clock = loop {
-        match pipeline.clock() {
-            Some(clock) => break clock,
-            None => std::thread::sleep(std::time::Duration::from_millis(50)), // FIXME: This is stupid
-        }
-    };
+    let clock = pipeline.clock().expect("checked above");
 
     if let Some(src_pad) = source.static_pad("src")
         && let Some(sink_pad) = sink.static_pad("sink")
@@ -149,10 +188,7 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
                 let total = encoding_latency + decoding_latency + network_latency;
                 if CLIENT_ARGS.latency_log {
                     info!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
-                } 
-                // else {
-                //     debug!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
-                // }
+                }
                 gst::PadProbeReturn::Ok
             });
         }
@@ -179,7 +215,6 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         Err(_) => panic!("Can't cast appsrc element to AppSrc struct"),
     };
 
-    let noti = Arc::new(tokio::sync::Notify::new());
     let noti2 = noti.clone();
 
     std::thread::spawn(move || {
@@ -200,7 +235,7 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
                 _ => (),
             }
         }
-        noti2.notify_one();
+        noti2.notify_waiters();
     });
 
     select! {
@@ -209,9 +244,8 @@ pub async fn start_pipeline() -> color_eyre::Result<()> {
         _ = noti.notified() => (),
     };
 
-    
     pipeline.set_state(gst::State::Null)?;
-    
+
     Ok(())
 }
 
@@ -234,7 +268,7 @@ async fn heartbeat(mut stream: TcpStream) -> color_eyre::Result<()> {
 async fn frame_receive(
     app_src: AppSrc,
     socket: UdpSocket,
-    tx: Sender<(Duration, Duration)>,
+    tx: watch::Sender<(Duration, Duration)>,
 ) -> color_eyre::Result<()> {
     let mut cur_seq_num = 0;
     let mut cur_total_size = 0;
@@ -312,4 +346,102 @@ async fn frame_receive(
             _ => (),
         }
     }
+}
+
+#[derive(Debug)]
+struct DisplayApp {
+    window: Option<Window>,
+    id_tx: Option<oneshot::Sender<usize>>,
+}
+
+impl DisplayApp {
+    pub fn new(tx: oneshot::Sender<usize>) -> Self {
+        Self {
+            window: None,
+            id_tx: Some(tx),
+        }
+    }
+}
+
+impl ApplicationHandler for DisplayApp {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let mut attrs = Window::default_attributes();
+        attrs.maximized = true;
+        self.window = match event_loop.create_window(attrs) {
+            Ok(window) => {
+                let window_handle = match window.window_handle() {
+                    Ok(x) => x,
+                    Err(e) => panic!("can't get window handle: {e}"),
+                };
+                let rwh = window_handle.as_raw();
+
+                let window_id = {
+                    use winit::raw_window_handle::RawWindowHandle;
+                    match rwh {
+                        RawWindowHandle::Xlib(handle) => handle.window as usize,
+                        RawWindowHandle::Wayland(handle) => handle.surface.as_ptr() as usize,
+                        RawWindowHandle::Win32(handle) => handle.hwnd.get() as usize,
+                        _ => panic!("unsupported platform"),
+                    }
+                };
+
+                let tx = self
+                    .id_tx
+                    .take()
+                    .expect("This is created with new() method");
+                match tx.send(window_id) {
+                    Ok(_) => (),
+                    Err(e) => panic!("Unable to send window id to main thread: {e}"),
+                }
+
+                Some(window)
+            }
+            Err(e) => {
+                error!("Unable to create windows: {e}");
+                None
+            }
+        };
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                debug!("The close button was pressed; stopping");
+                event_loop.exit();
+            }
+            WindowEvent::KeyboardInput {
+                device_id,
+                event,
+                is_synthetic,
+            } => {
+                if event.state == winit::event::ElementState::Pressed
+                    && let winit::keyboard::PhysicalKey::Code(key) = event.physical_key
+                    && key == winit::keyboard::KeyCode::KeyF
+                    && let Some(window) = &self.window
+                {
+                    if window.fullscreen().is_none() {
+                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                    } else {
+                        window.set_fullscreen(None);
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+fn create_window(tx: oneshot::Sender<usize>) -> color_eyre::Result<()> {
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
+    let mut app = DisplayApp::new(tx);
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
 }
