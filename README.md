@@ -1,5 +1,7 @@
 # quikcast
 
+![Demonstration of quikcast program](demo.gif)
+
 A simple, fast, reasonably high quality, low-latency, but high bandwidth screen casting/streaming solution using H264 codecs, Gstreamer, and Rust.
 
 ## Features

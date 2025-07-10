@@ -28,10 +28,11 @@ async fn main() -> color_eyre::Result<()> {
 
     // Lower priority of openh264dec because I can't deal with openh264 anymore
     // Get the default registry
-    let registry = gstreamer::Registry::get();
-    if let Some(plugin_feature) = registry.lookup_feature("openh264dec") {
-        plugin_feature.set_rank(gstreamer::Rank::from(1));
-    }
+
+    // let registry = gstreamer::Registry::get();
+    // if let Some(plugin_feature) = registry.lookup_feature("openh264dec") {
+    //     plugin_feature.set_rank(gstreamer::Rank::from(1));
+    // }
 
     let args = CliArgs::parse();
 
