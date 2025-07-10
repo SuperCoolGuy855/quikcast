@@ -113,6 +113,7 @@ pub async fn start_pipeline(
             Err(e) => panic!("Unable to link decodebin src pad with videoconvert sink pad: {e}"),
         }
     });
+    // TODO: Get videosink factory
 
     // Windows handle
     let window_id = rx.await?;
@@ -375,11 +376,12 @@ impl ApplicationHandler for DisplayApp {
                 };
                 let rwh = window_handle.as_raw();
 
+                // TODO: Wayland display context
                 let window_id = {
                     use winit::raw_window_handle::RawWindowHandle;
                     match rwh {
                         RawWindowHandle::Xlib(handle) => handle.window as usize,
-                        RawWindowHandle::Wayland(handle) => handle.surface.as_ptr() as usize,
+                        RawWindowHandle::Wayland(handle) => handle.surface.as_ptr() as usize, // TODO: Add display context too
                         RawWindowHandle::Win32(handle) => handle.hwnd.get() as usize,
                         _ => panic!("unsupported platform"),
                     }
