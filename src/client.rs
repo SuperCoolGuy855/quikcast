@@ -1,46 +1,147 @@
 use log::{debug, error, info, trace, warn};
-use std::f32::DIGITS;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::select;
 use tokio::sync::{Notify, oneshot, watch};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
-use winit::event_loop::EventLoop;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::Window;
 
-use color_eyre::eyre::{ContextCompat, bail};
-use gstreamer as gst;
+use crate::{CLIENT_ARGS, server};
+use color_eyre::eyre::{ContextCompat, WrapErr, bail};
 use gstreamer::prelude::*;
-use gstreamer_app::{self as gst_app, AppSrc};
+use gstreamer::{self as gst, Pipeline};
+use gstreamer_app::AppSrc;
 use gstreamer_video::prelude::VideoOverlayExtManual;
 use itertools::Itertools;
+use tokio::select;
 
-use crate::{CLIENT_ARGS, server};
+#[derive(Debug, Copy, Clone)]
+enum CustomEvent {
+    Stop,
+}
 
 pub async fn start_client() -> color_eyre::Result<()> {
-    let (tx, rx) = oneshot::channel();
-    let finish_noti = Arc::new(Notify::new());
-    let noti_clone = finish_noti.clone();
+    let (server_latency_tx, server_latency_rx) = watch::channel(Default::default());
+    let stop_flag = AtomicBool::new(false);
 
-    let pipeline_handle = tokio::spawn(start_pipeline(rx, noti_clone));
+    let (socket, stream) = start_network().await?;
 
-    create_window(tx)?;
+    let pipeline = get_pipeline()?;
+    let appsrc = get_appsrc_from_pipeline(&pipeline, "source")
+        .expect("Appsrc should exist and should be named source");
 
-    finish_noti.notify_waiters();
+    let event_loop: EventLoop<CustomEvent> = EventLoop::with_user_event().build()?;
+    let proxy_loop_for_async = event_loop.create_proxy();
+    let proxy_loop_for_bus = event_loop.create_proxy();
 
-    pipeline_handle.await??;
+    tokio::spawn(async move {
+        select! {
+            Err(e) = frame_receive(appsrc, socket, server_latency_tx) => {error!("Can't receive frame: {e}")},
+            Err(e) = heartbeat(stream) => {error!("Heartbeat failed! {e}")},
+        }
+        let _ = proxy_loop_for_async.send_event(CustomEvent::Stop); // This should work, if not then the window has closed already, probably...
+    });
+
+    // let pip_clone = pipeline.clone();
+    // std::thread::spawn(move || {
+    //     bus_monitor(&pip_clone);
+    //     debug!("What?");
+    //     // proxy_loop_for_bus.send_event(CustomEvent::Stop);
+    // });
+
+    start_window(event_loop, &pipeline, server_latency_rx)?;
+
+    pipeline.set_state(gst::State::Null)?;
+
     Ok(())
 }
 
-pub async fn start_pipeline(
-    rx: oneshot::Receiver<usize>,
-    noti: Arc<Notify>,
-) -> color_eyre::Result<()> {
+// FIXME: Pipeline freeze
+fn bus_monitor(pipeline: &Pipeline) {
+    let bus = pipeline.bus().expect("Pipeline should have a bus");
+
+    for msg in bus.iter_timed(None) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Error(e) => {
+                error!("Gstreamer error: {e}");
+                break;
+            }
+            MessageView::Eos(e) => {
+                warn!("EOS detected! {e:?}");
+                break;
+            }
+            MessageView::Warning(w) => {
+                warn!("Gstreamer warning: {w:?}");
+            }
+            _ => (),
+        }
+    }
+}
+
+fn set_window_id_on_pipeline(pipeline: &Pipeline, window_id: usize) -> color_eyre::Result<()> {
+    let bus = pipeline.bus().expect("Pipeline should have a bus");
+
+    bus.set_sync_handler(move |_bus, msg| {
+        use gst::MessageView;
+        if let MessageView::Element(e) = msg.view() {
+            if let Some(structure) = e.structure() {
+                if structure.name() == "prepare-window-handle" {
+                    if let Some(msg_src) = msg.src()
+                        && let Some(overlay) =
+                            msg_src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
+                    {
+                        unsafe {
+                            overlay.set_window_handle(window_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        gst::BusSyncReply::Pass
+    });
+
+    Ok(())
+}
+
+fn get_appsrc_from_pipeline(pipeline: &Pipeline, name: &str) -> color_eyre::Result<AppSrc> {
+    let appsrc_element = pipeline
+        .by_name(name)
+        .wrap_err(format!("Appsrc with name: {name} doesn't exist"))?;
+    let appsrc = match appsrc_element.downcast::<AppSrc>() {
+        Ok(x) => x,
+        Err(e) => bail!("Element with name: {name} is not appsrc. {e:?}"),
+    };
+
+    Ok(appsrc)
+}
+
+async fn start_network() -> color_eyre::Result<(UdpSocket, TcpStream)> {
+    let mut stream = TcpStream::connect(format!("{}:{}", CLIENT_ARGS.ip, CLIENT_ARGS.port)).await?;
+    info!(
+        "Connected to server {} with {}",
+        stream
+            .peer_addr()
+            .expect("TcpStream is connected and should have a peer address"),
+        stream
+            .local_addr()
+            .expect("TcpStream is connected and should have a local address")
+    );
+
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let udp_port = socket.local_addr()?.port();
+
+    stream.write_u16(udp_port).await?;
+
+    Ok((socket, stream))
+}
+
+fn get_pipeline() -> color_eyre::Result<Pipeline> {
     let source = gst::ElementFactory::make("appsrc")
         .name("source")
         .property_from_str("emit-signals", "false")
@@ -79,7 +180,7 @@ pub async fn start_pipeline(
         .property_from_str("sync", "false")
         .build()?;
 
-    let pipeline = gst::Pipeline::with_name("decoding");
+    let pipeline = Pipeline::with_name("decoding");
     pipeline.add_many([&source, &payload, &parser, &decoder, &convert, &sink])?;
 
     gst::Element::link_many([
@@ -113,33 +214,16 @@ pub async fn start_pipeline(
             Err(e) => panic!("Unable to link decodebin src pad with videoconvert sink pad: {e}"),
         }
     });
-    // TODO: Get videosink factory
 
-    // Windows handle
-    let window_id = rx.await?;
+    Ok(pipeline)
+}
 
+fn start_pipeline(
+    pipeline: &Pipeline,
+    server_latency_rx: watch::Receiver<(Duration, Duration)>,
+) -> color_eyre::Result<()> {
     pipeline.set_state(gst::State::Playing)?;
-    let bus = pipeline.bus().wrap_err("Unable to get pipeline's bus")?;
-
-    bus.set_sync_handler(move |_bus, msg| {
-        use gst::MessageView;
-        if let MessageView::Element(e) = msg.view() {
-            if let Some(structure) = e.structure() {
-                if structure.name() == "prepare-window-handle" {
-                    if let Some(msg_src) = msg.src()
-                        && let Some(overlay) =
-                            msg_src.dynamic_cast_ref::<gstreamer_video::VideoOverlay>()
-                    {
-                        unsafe {
-                            overlay.set_window_handle(window_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        gst::BusSyncReply::Pass
-    });
+    let bus = pipeline.bus().expect("Pipeline should have a bus");
 
     for msg in bus.iter_timed(None) {
         use gst::MessageView;
@@ -150,9 +234,13 @@ pub async fn start_pipeline(
         }
     }
 
-    let (tx, rx) = watch::channel(Default::default());
-
     // Latency pad probes
+    let source = pipeline
+        .by_name("source")
+        .expect("There is a source element in the pipeline");
+    let sink = pipeline
+        .by_name("source")
+        .expect("There is a sink element in the pipeline");
     let latency_start = Arc::new(AtomicU64::new(0));
     let clock = pipeline.clock().expect("checked above");
 
@@ -185,7 +273,7 @@ pub async fn start_pipeline(
                 let diff = now - start_time;
                 trace!("Latency: {} ms", diff as f64 / 1_000_000.0);
                 let decoding_latency = Duration::from_nanos(diff);
-                let (encoding_latency, network_latency) = *rx.borrow();
+                let (encoding_latency, network_latency) = *server_latency_rx.borrow();
                 let total = encoding_latency + decoding_latency + network_latency;
                 if CLIENT_ARGS.latency_log {
                     info!("Latency: E: {encoding_latency:?} \t N: {network_latency:?} \t D: {decoding_latency:?} \t T: {total:?}");
@@ -194,59 +282,6 @@ pub async fn start_pipeline(
             });
         }
     }
-
-    let mut stream = TcpStream::connect(format!("{}:{}", CLIENT_ARGS.ip, CLIENT_ARGS.port)).await?;
-    info!(
-        "Connected to server {} with {}",
-        stream
-            .peer_addr()
-            .expect("TcpStream is connected and should have a peer address"),
-        stream
-            .local_addr()
-            .expect("TcpStream is connected and should have a local address")
-    );
-
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let udp_port = socket.local_addr()?.port();
-
-    stream.write_u16(udp_port).await?;
-
-    let app_src = match source.downcast::<gst_app::AppSrc>() {
-        Ok(x) => x,
-        Err(_) => panic!("Can't cast appsrc element to AppSrc struct"),
-    };
-
-    let noti2 = noti.clone();
-
-    std::thread::spawn(move || {
-        for msg in bus.iter_timed(None) {
-            use gst::MessageView;
-            match msg.view() {
-                MessageView::Error(e) => {
-                    error!("Gstreamer error: {e}");
-                    break;
-                }
-                MessageView::Eos(e) => {
-                    warn!("EOS detected! {e:?}");
-                    break;
-                }
-                MessageView::Warning(w) => {
-                    warn!("Gstreamer warning: {w:?}");
-                }
-                _ => (),
-            }
-        }
-        noti2.notify_waiters();
-    });
-
-    select! {
-        Err(e) = heartbeat(stream) => {error!("{e}")}
-        Err(e) = frame_receive(app_src, socket, tx) => {error!("Can't receive frame: {e}");}
-        _ = noti.notified() => (),
-    };
-
-    pipeline.set_state(gst::State::Null)?;
-
     Ok(())
 }
 
@@ -352,19 +387,21 @@ async fn frame_receive(
 #[derive(Debug)]
 struct DisplayApp {
     window: Option<Window>,
-    id_tx: Option<oneshot::Sender<usize>>,
+    pipeline: Pipeline,
+    server_latency_rx: watch::Receiver<(Duration, Duration)>,
 }
 
 impl DisplayApp {
-    pub fn new(tx: oneshot::Sender<usize>) -> Self {
+    pub fn new(pipeline: &Pipeline, rx: watch::Receiver<(Duration, Duration)>) -> Self {
         Self {
             window: None,
-            id_tx: Some(tx),
+            pipeline: pipeline.clone(),
+            server_latency_rx: rx,
         }
     }
 }
 
-impl ApplicationHandler for DisplayApp {
+impl ApplicationHandler<CustomEvent> for DisplayApp {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let mut attrs = Window::default_attributes();
         attrs.maximized = true;
@@ -387,14 +424,17 @@ impl ApplicationHandler for DisplayApp {
                     }
                 };
 
-                let tx = self
-                    .id_tx
-                    .take()
-                    .expect("This is created with new() method");
-                match tx.send(window_id) {
+                match set_window_id_on_pipeline(&self.pipeline, window_id) {
                     Ok(_) => (),
-                    Err(e) => panic!("Unable to send window id to main thread: {e}"),
-                }
+                    Err(e) => panic!("Can't set window id to pipeline: {e}"),
+                };
+
+                match start_pipeline(&self.pipeline, self.server_latency_rx.clone()) {
+                    Ok(_) => (),
+                    Err(e) => panic!("Can't start pipeline: {e}"),
+                };
+
+                window.set_title("quikcast - client");
 
                 Some(window)
             }
@@ -408,18 +448,19 @@ impl ApplicationHandler for DisplayApp {
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        window_id: winit::window::WindowId,
+        _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
+        use winit::event::WindowEvent;
         match event {
             WindowEvent::CloseRequested => {
                 debug!("The close button was pressed; stopping");
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput {
-                device_id,
+                device_id: _,
                 event,
-                is_synthetic,
+                is_synthetic: _,
             } => {
                 if event.state == winit::event::ElementState::Pressed
                     && let winit::keyboard::PhysicalKey::Code(key) = event.physical_key
@@ -436,13 +477,24 @@ impl ApplicationHandler for DisplayApp {
             _ => (),
         }
     }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: CustomEvent) {
+        match event {
+            CustomEvent::Stop => {
+                event_loop.exit();
+            }
+        }
+    }
 }
 
-fn create_window(tx: oneshot::Sender<usize>) -> color_eyre::Result<()> {
-    let event_loop = EventLoop::new()?;
+fn start_window(
+    event_loop: EventLoop<CustomEvent>,
+    pipeline: &Pipeline,
+    rx: watch::Receiver<(Duration, Duration)>,
+) -> color_eyre::Result<()> {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = DisplayApp::new(tx);
+    let mut app = DisplayApp::new(pipeline, rx);
     event_loop.run_app(&mut app)?;
 
     Ok(())

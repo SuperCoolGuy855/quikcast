@@ -24,6 +24,8 @@ static CLIENT_ARGS: LazyLock<ClientArgs> = LazyLock::new(|| match CliArgs::parse
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
     gstreamer::init()?;
 
     // Lower priority of openh264dec because I can't deal with openh264 anymore
